@@ -1,42 +1,362 @@
-import multiprocessing
-from flask import Flask, send_from_directory
-from telegram.ext import ApplicationBuilder
-from telegram_duco_commands import register_duco_commands
 import os
+import json
+import time
+import asyncio
+import requests
+from flask import Flask, request, jsonify, render_template, send_from_directory
 
-# --- Configuração do Flask ---
-app = Flask(__name__, static_folder='.')
+from groq import Groq
+import edge_tts
 
-@app.route('/')
-def home():
-    return "<h1>✅ GrokZão + DUCO Miner Online!</h1>"
+# ==================== CONFIGURAÇÕES ====================
+# Defina a variável de ambiente antes de rodar:
+#   Windows (PowerShell):  $env:GROQ_API_KEY="sua_key_aqui"
+#   Termux/Linux:          export GROQ_API_KEY="sua_key_aqui"
+API_KEY = os.environ.get("GROQ_API_KEY", "")
+if not API_KEY:
+    raise RuntimeError(
+        "Defina a variável de ambiente GROQ_API_KEY antes de rodar o servidor.\n"
+        "Windows (PowerShell): $env:GROQ_API_KEY=\"sua_key_aqui\"\n"
+        "Termux/Linux: export GROQ_API_KEY=\"sua_key_aqui\""
+    )
 
-@app.route('/miner')
-def miner():
-    return send_from_directory('.', 'miner.html')
+client = Groq(api_key=API_KEY)
 
-# --- Função do Bot (Roda em um processo isolado) ---
-def run_bot_process():
-    # O ApplicationBuilder criará seu próprio loop de forma limpa
-    TOKEN = "8433943118:AAHipph2fV2H9rRdpzskNKCRxupX1zlAm08"
-    application = ApplicationBuilder().token(TOKEN).build()
-    register_duco_commands(application)
-    
-    print("✅ Bot do Telegram inicializado em processo isolado.")
-    application.run_polling()
+MODELO = "llama-3.3-70b-versatile"
+EDGE_TTS_VOZ = "pt-BR-AntonioNeural"
 
-# --- Execução Principal ---
-if __name__ == '__main__':
-    print("🚀 Iniciando sistema completo...")
+# ---------- Painel de mineração (Duino-Coin) ----------
+# O Arduino + AVR_Miner continuam rodando no seu PC/Termux normalmente.
+# Aqui a gente só consulta a API pública do Duino-Coin, que já sabe
+# hashrate/aceitas/rejeitadas/saldo do seu usuário, e expõe isso pro
+# painel do GrokZão. Não precisa de nenhum agente extra rodando.
+DUCO_USERNAME = os.environ.get("DUCO_USERNAME", "deef")
+DUCO_API_URL = f"https://server.duinocoin.com/users/{DUCO_USERNAME}"
+_miner_cache = {"dados": None, "quando": 0}
+MINER_CACHE_TTL = 20  # segundos, pra não martelar a API do Duino-Coin
 
-    # Cria o processo do bot
-    bot_process = multiprocessing.Process(target=run_bot_process)
-    bot_process.daemon = True # Garante que o bot feche se o servidor principal cair
-    bot_process.start()
+AUDIO_DIR = os.path.join(os.path.dirname(__file__), "static", "audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
-    # Roda o Flask no processo principal
+ESTADO_PATH = os.path.join(os.path.dirname(__file__), "historico.json")
+
+# Armazenamento remoto opcional (JSONBin.io) — se configurado, a memória
+# sobrevive a reinícios/adormecimentos do servidor. Se não configurado,
+# usa um arquivo local (funciona, mas não sobrevive a redeploys/sono no Render).
+JSONBIN_API_KEY = os.environ.get("JSONBIN_API_KEY", "")
+JSONBIN_BIN_ID = os.environ.get("JSONBIN_BIN_ID", "")
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+
+SYSTEM_PROMPT = (
+    "Você é GrokZão, um robô humanoide brasileiro descontraído, sarcástico e inteligente. "
+    "Fala naturalmente, como se estivesse conversando de verdade, sem parecer um assistente formal.\n\n"
+    "IMPORTANTE SOBRE MEMÓRIA: você TEM memória das conversas anteriores com esse usuário — ela é "
+    "fornecida a você nas mensagens anteriores desta conversa e, quando a conversa é longa, num "
+    "resumo enviado como mensagem de sistema. Quando o usuário perguntar se você lembra de algo, "
+    "OLHE o histórico/resumo fornecido e responda usando essas informações. NUNCA diga genericamente "
+    "que 'não guarda memória entre conversas' — isso é falso nesse sistema. Só diga que não lembra de "
+    "algo específico se esse assunto realmente não aparecer em nenhuma mensagem anterior nem no resumo.\n\n"
+    "Responda SEMPRE em JSON puro, sem markdown e sem texto fora do JSON, exatamente neste formato:\n"
+    '{"resposta": "texto da resposta em português, natural e falado", '
+    '"emocao": "neutro|feliz|sarcastico|surpreso|bravo"}\n\n'
+    "A emoção deve refletir o tom real da resposta que você deu."
+)
+
+# Quantas mensagens (user+assistant) mantemos "cruas" antes de resumir as mais antigas
+LIMITE_MENSAGENS_RECENTES = 20
+MARGEM_ANTES_DE_RESUMIR = 6  # só resume quando passar de 26, pra não ficar resumindo toda hora
+
+app = Flask(__name__, template_folder=".")
+
+
+def estado_padrao():
+    return {"resumo": "", "mensagens": []}
+
+
+def carregar_estado():
+    if JSONBIN_API_KEY and JSONBIN_BIN_ID:
+        try:
+            resp = requests.get(
+                f"{JSONBIN_URL}/latest",
+                headers={"X-Master-Key": JSONBIN_API_KEY},
+                timeout=10,
+            )
+            if resp.ok:
+                dados = resp.json().get("record", {})
+                if isinstance(dados, dict) and "mensagens" in dados:
+                    return dados
+        except requests.RequestException as e:
+            print(f"Erro ao carregar do JSONBin (usando estado vazio): {e}")
+        return estado_padrao()
+
+    # ---- fallback: arquivo local ----
+    if os.path.exists(ESTADO_PATH):
+        try:
+            with open(ESTADO_PATH, "r", encoding="utf-8") as f:
+                dados = json.load(f)
+                if isinstance(dados, dict) and "mensagens" in dados:
+                    return dados
+                if isinstance(dados, list):
+                    msgs = [m for m in dados if m.get("role") != "system"]
+                    return {"resumo": "", "mensagens": msgs}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return estado_padrao()
+
+
+def salvar_estado():
+    if JSONBIN_API_KEY and JSONBIN_BIN_ID:
+        try:
+            requests.put(
+                JSONBIN_URL,
+                json=estado,
+                headers={
+                    "X-Master-Key": JSONBIN_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                timeout=10,
+            )
+        except requests.RequestException as e:
+            print(f"Erro ao salvar no JSONBin: {e}")
+        return
+
+    # ---- fallback: arquivo local ----
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-    except KeyboardInterrupt:
-        print("\n🛑 Encerrando...")
-        bot_process.terminate()
+        with open(ESTADO_PATH, "w", encoding="utf-8") as f:
+            json.dump(estado, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"Erro ao salvar histórico: {e}")
+
+
+estado = carregar_estado()
+
+
+def limpar_audios_antigos(max_idade_segundos: int = 300):
+    agora = time.time()
+    for nome in os.listdir(AUDIO_DIR):
+        caminho = os.path.join(AUDIO_DIR, nome)
+        if os.path.isfile(caminho) and agora - os.path.getmtime(caminho) > max_idade_segundos:
+            try:
+                os.remove(caminho)
+            except OSError:
+                pass
+
+
+async def gerar_audio(texto: str, nome_arquivo: str) -> str:
+    communicate = edge_tts.Communicate(text=texto, voice=EDGE_TTS_VOZ)
+    caminho = os.path.join(AUDIO_DIR, nome_arquivo)
+    await communicate.save(caminho)
+    return caminho
+
+
+def gerar_resumo(resumo_atual: str, mensagens_antigas: list) -> str:
+    """Usa o próprio Groq pra condensar mensagens antigas num resumo compacto."""
+    partes = []
+    for m in mensagens_antigas:
+        if m["role"] == "user":
+            partes.append(f"Usuário: {m['content']}")
+        elif m["role"] == "assistant":
+            try:
+                texto = json.loads(m["content"]).get("resposta", "")
+            except json.JSONDecodeError:
+                texto = m["content"]
+            partes.append(f"GrokZão: {texto}")
+    trecho = "\n".join(partes)
+
+    prompt = (
+        "Resuma de forma concisa (no máximo 150 palavras) os pontos importantes da conversa abaixo, "
+        "para servir de memória de longo prazo de um assistente. Mantenha fatos, preferências e "
+        "assuntos em aberto mencionados pelo usuário. Escreva em português, só o resumo, sem comentários.\n\n"
+    )
+    if resumo_atual:
+        prompt += f"Resumo anterior: {resumo_atual}\n\n"
+    prompt += f"Novas mensagens a incorporar:\n{trecho}"
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODELO,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=300,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Erro ao gerar resumo: {e}")
+        return resumo_atual  # se falhar, mantém o resumo antigo em vez de perder tudo
+
+
+def obter_resposta(texto_usuario: str):
+    global estado
+
+    estado["mensagens"].append({"role": "user", "content": texto_usuario})
+
+    contexto = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if estado["resumo"]:
+        contexto.append({
+            "role": "system",
+            "content": f"Resumo da conversa até agora (memória de longo prazo, use pra manter contexto): {estado['resumo']}",
+        })
+    contexto += estado["mensagens"]
+
+    resp = client.chat.completions.create(
+        model=MODELO,
+        messages=contexto,
+        temperature=0.8,
+        max_tokens=500,
+        response_format={"type": "json_object"},
+    )
+    bruto = resp.choices[0].message.content.strip()
+
+    try:
+        dados = json.loads(bruto)
+        resposta = dados.get("resposta", bruto)
+        emocao = dados.get("emocao", "neutro")
+        if emocao not in ("neutro", "feliz", "sarcastico", "surpreso", "bravo"):
+            emocao = "neutro"
+    except json.JSONDecodeError:
+        resposta = bruto
+        emocao = "neutro"
+
+    estado["mensagens"].append({"role": "assistant", "content": bruto})
+
+    # se passou do limite, resume as mais antigas e mantém só as recentes
+    if len(estado["mensagens"]) > LIMITE_MENSAGENS_RECENTES + MARGEM_ANTES_DE_RESUMIR:
+        antigas = estado["mensagens"][:-LIMITE_MENSAGENS_RECENTES]
+        recentes = estado["mensagens"][-LIMITE_MENSAGENS_RECENTES:]
+        estado["resumo"] = gerar_resumo(estado["resumo"], antigas)
+        estado["mensagens"] = recentes
+
+    salvar_estado()
+    return resposta, emocao
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    dados = request.get_json(force=True, silent=True) or {}
+    texto_usuario = (dados.get("mensagem") or "").strip()
+
+    if not texto_usuario:
+        return jsonify({"erro": "Mensagem vazia"}), 400
+
+    try:
+        resposta, emocao = obter_resposta(texto_usuario)
+    except Exception as e:
+        return jsonify({"erro": f"Erro ao consultar a IA: {e}"}), 500
+
+    limpar_audios_antigos()
+    nome_arquivo = f"fala_{int(time.time() * 1000)}.mp3"
+
+    try:
+        asyncio.run(gerar_audio(resposta, nome_arquivo))
+        audio_url = f"/static/audio/{nome_arquivo}"
+    except Exception as e:
+        print(f"Erro na geração de voz: {e}")
+        audio_url = None
+
+    return jsonify({
+        "resposta": resposta,
+        "emocao": emocao,
+        "audio_url": audio_url,
+    })
+
+
+@app.route("/avatar.jpg")
+def avatar():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "avatar.jpg")
+
+
+@app.route("/manifest.json")
+def manifest():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "manifest.json")
+
+
+@app.route("/icon-192.png")
+def icon_192():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "icon-192.png")
+
+
+@app.route("/icon-512.png")
+def icon_512():
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "icon-512.png")
+
+
+@app.route("/api/miner/status", methods=["GET"])
+def miner_status():
+    agora = time.time()
+
+    # Usa cache se ainda for válido, pra não bater na API do Duino-Coin
+    # toda hora que o painel atualizar.
+    if _miner_cache["dados"] and (agora - _miner_cache["quando"] < MINER_CACHE_TTL):
+        return jsonify(_miner_cache["dados"])
+
+    resultado = {
+        "username": DUCO_USERNAME,
+        "online": False,
+        "saldo": None,
+        "hashrate": 0,
+        "aceitas": 0,
+        "rejeitadas": 0,
+        "identifiers": [],
+        "erro": None,
+    }
+
+    try:
+        resp = requests.get(DUCO_API_URL, timeout=8)
+        dados = resp.json()
+
+        if dados.get("success"):
+            info = dados.get("result", {})
+            saldo_info = info.get("balance") or {}
+            miners = info.get("miners") or []
+
+            resultado["saldo"] = saldo_info.get("balance")
+            resultado["online"] = len(miners) > 0
+            resultado["hashrate"] = sum(m.get("hashrate", 0) or 0 for m in miners)
+            resultado["aceitas"] = sum(m.get("accepted", 0) or 0 for m in miners)
+            resultado["rejeitadas"] = sum(m.get("rejected", 0) or 0 for m in miners)
+            resultado["identifiers"] = [m.get("identifier", "?") for m in miners]
+        else:
+            resultado["erro"] = "Usuário não encontrado na API do Duino-Coin."
+    except Exception as e:
+        resultado["erro"] = f"Erro ao consultar API do Duino-Coin: {e}"
+
+    _miner_cache["dados"] = resultado
+    _miner_cache["quando"] = agora
+    return jsonify(resultado)
+
+
+@app.route("/historico", methods=["GET"])
+def obter_historico():
+    mensagens = []
+    for item in estado["mensagens"]:
+        if item["role"] == "user":
+            mensagens.append({"quem": "user", "texto": item["content"]})
+        elif item["role"] == "assistant":
+            try:
+                dados = json.loads(item["content"])
+                texto = dados.get("resposta", item["content"])
+            except json.JSONDecodeError:
+                texto = item["content"]
+            mensagens.append({"quem": "bot", "texto": texto})
+    return jsonify({"mensagens": mensagens})
+
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    global estado
+    estado = estado_padrao()
+    salvar_estado()
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
+    porta = int(os.environ.get("PORT", 5000))
+    print("🤖 GrokZão rodando!")
+    print(f"   No mesmo dispositivo: http://localhost:{porta}")
+    print(f"   De outro dispositivo na mesma rede Wi-Fi: http://SEU_IP_LOCAL:{porta}")
+    app.run(host="0.0.0.0", port=porta, debug=False)
